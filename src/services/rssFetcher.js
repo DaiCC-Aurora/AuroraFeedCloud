@@ -66,10 +66,35 @@ function parseDuration(raw) {
 
 /**
  * 抓取并解析 RSS Feed。
+ * 增加了 XML 清洗逻辑，兼容各种包含未转义 `&` 的不规范 RSS 源。
  * @returns {Promise<{title: string, items: Array<object>}>}
  */
 async function fetchFeed(feedUrl) {
-  const feed = await parser.parseURL(feedUrl);
+  let xmlString;
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 15000);
+    const response = await fetch(feedUrl, {
+      headers: { 'User-Agent': 'podcast-cloud/1.0 (+https://vercel.com)' },
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    xmlString = await response.text();
+  } catch (e) {
+    throw new Error(`Failed to fetch RSS feed (${feedUrl}): ${e.message}`);
+  }
+
+  // 清洗 XML：将未转义的 `&` 替换为 `&amp;`，防止 sax 解析器报 "Invalid character in entity name"
+  // 匹配 & 后面不是合法实体（如 &amp; &lt; &gt; &quot; &apos; &#123; &#x1A;）的情况
+  xmlString = xmlString.replace(/&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)/gi, '&amp;');
+
+  let feed;
+  try {
+    feed = await parser.parseString(xmlString);
+  } catch (parseError) {
+    throw new Error(`RSS XML 解析失败，请检查源格式: ${parseError.message}`);
+  }
 
   const items = (feed.items || [])
     .map((item) => {
