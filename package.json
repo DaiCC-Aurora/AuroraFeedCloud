@@ -1,0 +1,21 @@
+{
+  "name": "podcast-cloud",
+  "version": "1.0.0",
+  "description": "英语听力播客云端服务：RSS 抓取 + 字幕生成 + Feed API（Vercel + Supabase）",
+  "main": "api/index.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node api/index.js",
+    "dev": "node --watch api/index.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.4",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "rss-parser": "^3.13.0"
+  },
+  "license": "MIT"
+}
