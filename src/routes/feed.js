@@ -32,6 +32,7 @@ router.get('/', async (req, res, next) => {
       pub_date: row.published_at,
       audio_url: row.audio_url,
       subtitle_url: row.subtitle_url || null,
+      subtitle_vtt: row.subtitle_vtt || null,
       duration_seconds: row.duration_seconds,
       transcript: row.subtitle_text || null,
     }));

@@ -138,6 +138,7 @@ curl -X POST https://<你的项目>.vercel.app/api/cron/update \
       "pub_date": "2026-08-21T08:00:00Z",
       "audio_url": "https://external-audio-cdn.com/....mp3",
       "subtitle_url": null,
+      "subtitle_vtt": "WEBVTT\n\n00:00.000 --> 00:03.000\nHello everyone...",
       "duration_seconds": 420,
       "transcript": "Full subtitle text here..."
     }
@@ -145,14 +146,18 @@ curl -X POST https://<你的项目>.vercel.app/api/cron/update \
 }
 ```
 
+> `subtitle_vtt` 是带时间戳的 VTT 字幕（Whisper 转录产物），手表端据此像歌词一样逐行实时显示；`transcript` 是同内容的纯文本。
+
 ### POST /api/cron/update
 
 抓取 RSS、过滤新增 + 重试 pending、生成字幕、写入数据库、清理旧数据。需要 `x-cron-secret` 头（值为 `CRON_SECRET`）。
 
 ## 常见问题
 
-- **免费额度用尽（HTTP 429）**：Cloudflare 免费计划每天 10,000 neurons，用尽后接口返回 429。本服务会自动回退 RSS 描述，条目保持 `pending`，**次日额度重置后 cron 自动重试**，无需人工干预。只要不绑定支付方式就不会产生费用。
-- **转录失败/超时**：Vercel 免费计划函数最长执行 60s，音频较长时 Whisper 转录可能超时。超时会回退 RSS 描述并保留 `pending`，下次 cron 自动重试（最多 `TRANSCRIPT_MAX_ATTEMPTS` 次，默认 3，之后标记 `failed`）。可改用更短的音频，或在 Vercel 升 Pro（300s）后提高 `TRANSCRIPT_API_TIMEOUT_MS`。
+- **字幕是"歌词式实时字幕"吗？** 是。Whisper 转录结果会保存为带时间戳的 VTT（`subtitle_vtt`），手表端播放时按进度逐行高亮，像歌词一样。RSS 自带的 description 只是节目简介，**不再当作字幕**使用。
+- **免费额度用尽（HTTP 429）**：Cloudflare 免费计划每天 10,000 neurons，用尽后接口返回 429。本服务会自动跳过后续转录，条目保持 `pending`，**次日额度重置后 cron 自动重试**，无需人工干预。只要不绑定支付方式就不会产生费用。
+- **转录失败/超时**：Vercel 免费计划函数最长执行 60s，音频较长时 Whisper 转录可能超时。超时会保留 `pending`，下次 cron 自动重试（最多 `TRANSCRIPT_MAX_ATTEMPTS` 次，默认 3，之后标记 `failed`）。可改用更短的音频，或在 Vercel 升 Pro（300s）后提高 `TRANSCRIPT_API_TIMEOUT_MS`。
 - **转录一直 pending**：检查 `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_API_TOKEN` 是否正确、Token 是否勾选了 "Workers AI: Run" 权限；或查看该条目的 `transcription_error` 字段定位原因。
+- **老节目没有 VTT 字幕**：早期版本把 RSS 简介当字幕、没有时间轴。升级后 cron 会自动重转录这些老条目（`ready` 但无 `subtitle_vtt` 的会被重新转录），新条目直接就有实时字幕。
 - **guid 冲突**：`episodes.guid` 唯一；RSS 的 `guid` 相同则跳过，不会重复插入。
 - **Supabase 行数上限**：免费层 5000 行，`MAX_KEEP_EPISODES`（默认 30）会自动清理最旧记录。

@@ -38,10 +38,13 @@ async function cleanupOldEpisodes(supabase, keepCount) {
  * POST /api/cron/update
  * 由 Vercel Cron（或 cron-job.org）调用。流程：
  *   1. 抓取 RSS
- *   2. 过滤新增条目 + 上次转录失败(pending)的旧条目（重试）
- *   3. 对新条目/待重试条目生成字幕（Cloudflare Workers AI / Groq，失败回退 RSS description）
+ *   2. 过滤：新增条目 + 需要（重新）转录的旧条目
+ *   3. 逐条调用 Whisper 生成"带时间戳的实时字幕"（VTT），失败回退 pending 次日重试
  *   4. 写入 episodes（新条目 insert，旧条目 update）
  *   5. 清理最旧记录
+ *
+ * 重要：RSS 自带的 description 只是节目简介，不是实时字幕，
+ * 因此不再把它写入 subtitle_text；只有 Whisper 转录结果才算字幕。
  */
 router.post('/update', async (req, res, next) => {
   const startedAt = Date.now();
@@ -72,10 +75,10 @@ router.post('/update', async (req, res, next) => {
     const feed = await fetchFeed(rssUrl);
     result.fetched = feed.items.length;
 
-    // 2. 过滤新增 + 待重试
+    // 2. 过滤新增 + 需要（重新）转录的旧条目
     const { data: existing, error: existingErr } = await supabase
       .from('episodes')
-      .select('guid, transcription_status, audio_url, subtitle_text, attempts');
+      .select('guid, transcription_status, audio_url, subtitle_vtt, attempts');
     if (existingErr) throw existingErr;
     const rows = existing || [];
     const known = new Set(rows.map((e) => e.guid));
@@ -86,23 +89,22 @@ router.post('/update', async (req, res, next) => {
     const retryLimit = Math.max(parseInt(process.env.TRANSCRIPT_MAX_ATTEMPTS || '3', 10), 0);
     const canTranscribe = apiType !== 'none' && hasTranscriptConfig(apiType);
 
-    // pending 且还有重试次数的旧条目：本轮重新转录
-    // （Cloudflare 免费额度每日自动重置，昨日额度用尽导致的 pending 今日可自动恢复）
+    // 旧条目中需要真实字幕的：
+    //  - 上次转录失败（pending）
+    //  - 或标记 ready 但没有 VTT（早期版本把 RSS 简介当字幕，需重新转录成实时字幕）
+    const needsRealSubtitle = (e) =>
+      e.audio_url &&
+      (e.transcription_status === 'pending' ||
+        (e.transcription_status === 'ready' && !e.subtitle_vtt)) &&
+      (e.attempts || 0) < retryLimit;
+
     const pendingItems = canTranscribe
-      ? rows
-          .filter(
-            (e) =>
-              e.transcription_status === 'pending' &&
-              e.audio_url &&
-              (e.attempts || 0) < retryLimit
-          )
-          .map((e) => ({
-            guid: e.guid,
-            isUpdate: true,
-            attempts: e.attempts || 0,
-            audio_url: e.audio_url,
-            transcript: e.subtitle_text || null,
-          }))
+      ? rows.filter(needsRealSubtitle).map((e) => ({
+          guid: e.guid,
+          isUpdate: true,
+          attempts: e.attempts || 0,
+          audio_url: e.audio_url,
+        }))
       : [];
     result.retried = pendingItems.length;
 
@@ -111,7 +113,6 @@ router.post('/update', async (req, res, next) => {
         guid: i.guid,
         isUpdate: false,
         audio_url: i.audio_url,
-        transcript: i.transcript || null,
         item: i,
       })),
       ...pendingItems,
@@ -119,42 +120,35 @@ router.post('/update', async (req, res, next) => {
 
     let quotaExhausted = false;
 
-    // 3+4. 逐条处理，单条失败不影响其余
+    // 3+4. 逐条转录（只有 Whisper 转录结果才算实时字幕），单条失败不影响其余
     for (const work of workItems) {
-      // 免费额度用尽：跳过待重试条目（不消耗重试次数），新条目仍以 RSS 描述兜底入库
+      // 免费额度用尽：跳过待重试条目（不消耗重试次数），新条目仍先入库
       if (quotaExhausted && work.isUpdate) continue;
 
       try {
-        let transcript = work.transcript || null;
-        let status = work.isUpdate ? 'pending' : 'ready';
-        let vtt = null;
+        let transcript = null; // 实时字幕纯文本（仅来自 Whisper 转录）
+        let vtt = null;        // 带时间戳的 VTT 字幕（歌词式逐行显示的真正数据源）
+        let status = 'pending';
         let lastError = null;
 
-        if (!quotaExhausted && !transcript && canTranscribe) {
+        if (!quotaExhausted && canTranscribe && work.audio_url) {
           try {
-            const r = await generateTranscript(
-              { audioUrl: work.audio_url, apiType },
-              transcript
-            );
-            transcript = r.transcript;
+            const r = await generateTranscript({ audioUrl: work.audio_url, apiType }, null);
+            transcript = r.transcript || null;
             vtt = r.vtt || null;
-            status = r.transcript ? 'ready' : 'pending';
+            status = transcript ? 'ready' : 'pending';
           } catch (err) {
             // 转录失败：保留 pending，下次 cron 重试
             status = 'pending';
             lastError = err.message;
-            transcript = err.fallback || null;
             if (err.quotaExhausted) {
               quotaExhausted = true;
               console.warn(
                 '[cron] Cloudflare Workers AI 免费额度已用完：本次跳过后续转录，' +
-                  '新条目以 RSS 描述兜底，待重试条目明日 cron 自动重试'
+                  '新条目先入库，待重试条目明日 cron 自动重试'
               );
             }
           }
-        } else if (!transcript) {
-          // 无字幕且未配置转录：标记 pending 待后续重试
-          status = 'pending';
         }
 
         if (work.isUpdate) {
