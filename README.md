@@ -19,7 +19,8 @@ podcast-cloud/
     ├── services/
     │   ├── supabaseClient.js   # Supabase 客户端（懒加载）
     │   ├── rssFetcher.js       # RSS 解析 + guid/时长归一化
-    │   └── transcriptService.js# 字幕生成：Cloudflare Workers AI / Groq Whisper（含 RSS 兜底）
+    │   ├── mp3Chunker.js       # MP3 帧级切分（无原生依赖，CBR/VBR 时间精确到帧）
+    │   └── transcriptService.js# 字幕生成：Cloudflare Workers AI / Groq Whisper（含自动分段）
     └── utils/dateUtils.js      # 时间工具（ISO 8601）
 ```
 
@@ -156,7 +157,8 @@ curl -X POST https://<你的项目>.vercel.app/api/cron/update \
 
 - **字幕是"歌词式实时字幕"吗？** 是。Whisper 转录结果会保存为带时间戳的 VTT（`subtitle_vtt`），手表端播放时按进度逐行高亮，像歌词一样。RSS 自带的 description 只是节目简介，**不再当作字幕**使用。
 - **免费额度用尽（HTTP 429）**：Cloudflare 免费计划每天 10,000 neurons，用尽后接口返回 429。本服务会自动跳过后续转录，条目保持 `pending`，**次日额度重置后 cron 自动重试**，无需人工干预。只要不绑定支付方式就不会产生费用。
-- **转录失败/超时**：Vercel 免费计划函数最长执行 60s，音频较长时 Whisper 转录可能超时。超时会保留 `pending`，下次 cron 自动重试（最多 `TRANSCRIPT_MAX_ATTEMPTS` 次，默认 3，之后标记 `failed`）。可改用更短的音频，或在 Vercel 升 Pro（300s）后提高 `TRANSCRIPT_API_TIMEOUT_MS`。
+- **转录失败/超时**：Vercel 免费计划函数最长执行 60s，音频较长时 Whisper 转录可能超时。超时会保留 `pending`，下次 cron 自动重试（最多 `TRANSCRIPT_MAX_ATTEMPTS` 次，默认 3，之后标记 `failed`）。可调小 `TRANSCRIPT_CF_CHUNK_SECONDS` 让每段更快返回，或在 Vercel 升 Pro（300s）后提高 `TRANSCRIPT_API_TIMEOUT_MS`。
+- **音频超过 24MB 怎么办**：RSS 源的整集音频普遍 >24MB。服务会自动**分段转录**：按 MP3 帧精确切分（每段默认 10 分钟）→ 各段并发转录 → 文本/VTT 按帧级时间戳偏移合并，字幕仍然同步准确。若源不是 MP3（无法帧级切分）且超过上限，会保留 `pending` 并在 `transcription_error` 中说明。
 - **转录一直 pending**：检查 `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_API_TOKEN` 是否正确、Token 是否勾选了 "Workers AI: Run" 权限；或查看该条目的 `transcription_error` 字段定位原因。
 - **老节目没有 VTT 字幕**：早期版本把 RSS 简介当字幕、没有时间轴。升级后 cron 会自动重转录这些老条目（`ready` 但无 `subtitle_vtt` 的会被重新转录），新条目直接就有实时字幕。
 - **guid 冲突**：`episodes.guid` 唯一；RSS 的 `guid` 相同则跳过，不会重复插入。

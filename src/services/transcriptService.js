@@ -15,6 +15,23 @@
 
 const CLOUDFLARE_AI_BASE = 'https://api.cloudflare.com/client/v4/accounts';
 const GROQ_TRANSCRIPT_ENDPOINT = 'https://api.groq.com/openai/v1/audio/transcriptions';
+const { chunkMp3, offsetVtt } = require('./mp3Chunker');
+
+/**
+ * 带并发上限的批量执行：分段转录时避免同时打爆 API 限流。
+ */
+async function mapWithConcurrency(items, limit, fn) {
+  const results = new Array(items.length);
+  let i = 0;
+  async function worker() {
+    while (i < items.length) {
+      const idx = i++;
+      results[idx] = await fn(items[idx], idx);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(Math.max(limit, 1), items.length) }, worker));
+  return results;
+}
 
 /**
  * 判断当前 apiType 是否具备可用的转录配置。
@@ -126,10 +143,49 @@ async function requestWorkersAI(cfg) {
 }
 
 /**
+ * 分段转录（音频超过 Cloudflare 单次大小上限时使用）：
+ * 帧级切分 MP3 → 并发转录各段 → 合并文本与 VTT（时间戳按段偏移，精确到帧）。
+ */
+async function transcribeInChunks(buffer, cfg) {
+  const chunkSeconds = Math.max(parseInt(process.env.TRANSCRIPT_CF_CHUNK_SECONDS || '600', 10), 30);
+  const concurrency = parseInt(process.env.TRANSCRIPT_CF_CHUNK_CONCURRENCY || '3', 10);
+  const chunks = chunkMp3(buffer, chunkSeconds, cfg.maxAudioBytes);
+  if (chunks.length === 0) {
+    throw new Error('音频无法解析为 MP3 帧流且超过大小上限，无法分段转录');
+  }
+
+  const results = await mapWithConcurrency(chunks, concurrency, async (c) => {
+    const r = await requestWorkersAI({
+      accountId: cfg.accountId,
+      apiToken: cfg.apiToken,
+      model: cfg.model,
+      body: { audio: c.buffer.toString('base64') },
+      timeoutMs: cfg.timeoutMs,
+    });
+    return { text: r.text, vtt: r.vtt, startMs: c.startMs };
+  });
+
+  const texts = [];
+  const vttParts = [];
+  for (const r of results) {
+    if (r.text) texts.push(r.text);
+    if (r.vtt) vttParts.push(offsetVtt(r.vtt, r.startMs));
+  }
+  const text = texts.join(' ').replace(/\s+/g, ' ').trim();
+  if (!text) throw new Error('分段转录结果为空');
+  const vtt =
+    vttParts.length > 0
+      ? `WEBVTT\n\n${vttParts.join('\n\n').replace(/^WEBVTT\s*\r?\n?/i, '')}`
+      : null;
+  return { text, vtt, srt: null };
+}
+
+/**
  * 调用 Cloudflare Workers AI Whisper 转录音频（自适应输入方式）。
  * 先试 audio_url（部分模型支持，免下载省函数时间）；
  * 若模型只接受 base64 audio（如 @cf/openai/whisper，HTTP 400），
- * 自动下载音频 → base64 重试。
+ * 自动下载音频：未超上限则单次 base64 上传；
+ * 超过上限（如 RSS 源音频普遍 >24MB）则自动分段（MP3 帧级切分 + 并发转录 + 时间戳合并）。
  * @param {string} audioUrl 音频 URL（需公网可访问的 HTTPS 地址）
  * @param {object} cfg { accountId, apiToken, model, timeoutMs }
  * @returns {Promise<{text: string, vtt: string|null, srt: string|null}>}
@@ -149,22 +205,34 @@ async function transcribeWithWorkersAI(audioUrl, cfg) {
   } catch (e) {
     if (!(e && e.badInput)) throw e;
 
-    // 该模型不接受 audio_url → 下载音频转 base64 重试
+    // 该模型不接受 audio_url → 下载音频
     const downloadTimeoutMs = parseInt(process.env.TRANSCRIPT_DOWNLOAD_TIMEOUT_MS || '30000', 10);
     const maxAudioMb = Math.max(parseInt(process.env.TRANSCRIPT_CF_MAX_AUDIO_MB || '24', 10), 1);
+    const maxAudioBytes = maxAudioMb * 1024 * 1024;
     const { buffer } = await downloadAudioBuffer(audioUrl, downloadTimeoutMs);
-    if (buffer.length > maxAudioMb * 1024 * 1024) {
-      throw new Error(
-        `音频文件过大（${(buffer.length / 1024 / 1024).toFixed(1)}MB），` +
-          `超过 Cloudflare Workers AI ${maxAudioMb}MB 上限（可用 TRANSCRIPT_CF_MAX_AUDIO_MB 调整），无法转录`
-      );
+
+    // 未超上限：单次上传
+    if (buffer.length <= maxAudioBytes) {
+      return await requestWorkersAI({
+        accountId,
+        apiToken,
+        model,
+        body: { audio: buffer.toString('base64') },
+        timeoutMs,
+      });
     }
-    return await requestWorkersAI({
+
+    // 超过上限：分段转录
+    console.log(
+      `[transcript] 音频 ${(buffer.length / 1024 / 1024).toFixed(1)}MB 超过 ${maxAudioMb}MB 上限，` +
+        `自动分段转录（每段 ${process.env.TRANSCRIPT_CF_CHUNK_SECONDS || 600}s，并发 ${process.env.TRANSCRIPT_CF_CHUNK_CONCURRENCY || 3}）`
+    );
+    return await transcribeInChunks(buffer, {
       accountId,
       apiToken,
       model,
-      body: { audio: buffer.toString('base64') },
       timeoutMs,
+      maxAudioBytes,
     });
   }
 }
