@@ -15,7 +15,8 @@ podcast-cloud/
 ├── schema.sql                  # Supabase 建表 SQL
 ├── api/index.js                # Vercel serverless 入口（也是本地开发入口）
 ├── cloudflare-worker/
-│   └── worker.js               # 异步字幕转录 Worker（粘贴到 CF 控制台部署）
+│   ├── worker.js               # 异步字幕转录 Worker（粘贴到 CF 控制台部署）
+│   └── wrangler.toml           # wrangler 命令行部署配置（AI 绑定 + Cron）
 └── src/
     ├── index.js                # Express app 组装
     ├── routes/
@@ -39,18 +40,40 @@ podcast-cloud/
 
 ## 二、部署字幕转录 Worker（Cloudflare Workers，免费）
 
-转录由 Cloudflare Worker 完成（不受 Vercel 60s 限制）。部署步骤：
+转录由 Cloudflare Worker 完成（不受 Vercel 60s 限制）。两种部署方式任选其一：
+
+### 方式 A：网页控制台直接粘贴（无需配置文件）
 
 1. 注册 [Cloudflare](https://dash.cloudflare.com/sign-up)（保持 **Free 免费计划，不要绑定支付方式**——免费计划每天送 10,000 neurons，额度用尽会拒绝请求并自动重试，**绝不会产生任何费用**）。
-2. **Workers & Pages → Create → Worker** → 把 [`cloudflare-worker/worker.js`](./cloudflare-worker/worker.js) 全部内容粘贴进去 → **Deploy**。
-3. 在 Worker 的 **Settings → Variables and Secrets** 添加：
+2. **Workers & Pages → Create → Worker**：填名字（如 `podcast-transcriber`）→ 随便选一个模板点 **Deploy**（先创建一个默认 Worker）。
+3. 点 **Edit code** → 全选删掉模板代码 → 把 [`cloudflare-worker/worker.js`](./cloudflare-worker/worker.js) 的全部内容粘贴进去 → 右下角 **Deploy**。
+4. 在 Worker 的 **Settings → Variables and Secrets** 添加：
    - `SUPABASE_URL`（Supabase Settings → API 的 Project URL）
    - `SUPABASE_SERVICE_ROLE_KEY`（同上，service_role key）
    - `CRON_SECRET`（手动触发用的密钥，可随意设）
    - 可选调参：`TRANSCRIPT_CF_MODEL`（默认 `@cf/openai/whisper`，可换更快的 `@cf/onnx-community/whisper-large-v3-turbo`）、`TRANSCRIPT_CF_CHUNK_SECONDS`（默认 600）、`TRANSCRIPT_CF_CHUNK_CONCURRENCY`（默认 3）、`TRANSCRIPT_CF_MAX_AUDIO_MB`（默认 24）、`TRANSCRIPT_MAX_ATTEMPTS`（默认 3）
-4. 在 Worker 的 **Settings → Variables** 添加 **"Workers AI" 绑定**，变量名填 `AI`。
-5. （可选）**Triggers → Cron Triggers** 添加定时任务（如每小时 `* * * *`，免费套餐的触发频率以控制台提示为准），让转录自动跑。
-6. 手动触发验证：
+5. **Settings → Variables → 添加绑定 → Workers AI**，变量名填 `AI`。
+6. （可选）**Triggers → Cron Triggers** 添加定时任务（如每小时 `* * * *`，免费套餐的触发频率以控制台提示为准）。
+7. 手动触发验证：见下方"手动触发"。
+
+### 方式 B：wrangler 命令行（需要配置文件）
+
+仓库里已带 [`cloudflare-worker/wrangler.toml`](./cloudflare-worker/wrangler.toml)（含 Workers AI 绑定 + 每小时 Cron）。
+
+```bash
+cd podcast-cloud/cloudflare-worker
+npm i -D wrangler            # 或全局 npx wrangler
+npx wrangler login           # 浏览器授权一次
+npx wrangler deploy          # 部署（自动读取 wrangler.toml）
+# 设置敏感变量（务必用 secret，不要写进 toml）：
+npx wrangler secret put SUPABASE_URL
+npx wrangler secret put SUPABASE_SERVICE_ROLE_KEY
+npx wrangler secret put CRON_SECRET
+```
+
+> 若 `npx wrangler deploy` 报 "Missing config file"，说明不在 `cloudflare-worker/` 目录下，先 `cd` 进去再执行。
+
+### 手动触发（两种方式通用）
 
 ```bash
 curl -X POST https://<你的worker>.workers.dev/run -H "x-cron-secret: <CRON_SECRET>"
